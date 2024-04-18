@@ -1,0 +1,3 @@
+# minLlama3
+
+This repo is meant as a guide on how Llama3's architecture works in the same vein of [Andrej Karpathy's minGPT](https://www.youtube.com/watch?v=kCc8FmEb1nY) (hint: it's the same as Llama2). Over in 'tutorial.ipynb' I'll hold your hand through every single operation performed in Llama 3, and in 'model.py' you can check out what that code looks like once it's turned into actual pytorch `nn.Module` objects. 
