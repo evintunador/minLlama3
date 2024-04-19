@@ -1,35 +1,27 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
-
+# Heavily edited from Meta's original at https://github.com/meta-llama/llama3/blob/main/llama/model.py
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
 from torch import nn
 
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096
-    n_layers: int = 32
-    n_heads: int = 32
-    n_kv_heads: Optional[int] = None
+    dim: int = 128 # 4096
+    n_layers: int = 4 # 32
+    n_heads: int = 4 # 32
+    n_kv_heads: Optional[int] = 1 # None
     vocab_size: int = -1
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
-    rope_theta: float = 500000
+    rope_theta: float = 10000 # 500000
 
     max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_seq_len: int = 128 # 2048
 
 
 class RMSNorm(torch.nn.Module):
@@ -91,46 +83,35 @@ class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = fs_init.get_model_parallel_world_size()
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.n_rep = args.n_heads // self.n_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
+        self.wq = nn.Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wk = ColumnParallelLinear(
+        self.wk = nn.Linear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wv = ColumnParallelLinear(
+        self.wv = nn.Linear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
             bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
         )
 
         self.cache_k = torch.zeros(
             (
                 args.max_batch_size,
                 args.max_seq_len,
-                self.n_local_kv_heads,
+                self.n_kv_heads,
                 self.head_dim,
             )
         ).cuda()
@@ -138,7 +119,7 @@ class Attention(nn.Module):
             (
                 args.max_batch_size,
                 args.max_seq_len,
-                self.n_local_kv_heads,
+                self.n_kv_heads,
                 self.head_dim,
             )
         ).cuda()
@@ -153,9 +134,9 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -171,21 +152,21 @@ class Attention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(
             keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
         values = repeat_kv(
             values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
         values = values.transpose(
             1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        )  # (bs, n_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask  # (bs, n_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -205,15 +186,9 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
-        )
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -255,17 +230,15 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = VocabParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
-        )
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        self.output = nn.Linear(
+            params.dim, params.vocab_size, bias=False
         )
 
         self.freqs_cis = precompute_freqs_cis(

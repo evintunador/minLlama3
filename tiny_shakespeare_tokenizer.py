@@ -1,19 +1,5 @@
-# Importing pytorch
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-
-# used for the tokenizer
 import pickle
 import os
-
-# Load the tokenizer data using pickle
-with open('./tokenizers/tokenizer.model', 'rb') as f:
-    loaded_tokenizer_data = pickle.load(f)
-
-# Extract the stoi mapping and merges from the loaded data
-loaded_stoi = loaded_tokenizer_data['stoi']
-loaded_merges = loaded_tokenizer_data['merges']
 
 class SimpleTokenizer:
     def __init__(self, stoi, merges):
@@ -61,4 +47,14 @@ class SimpleTokenizer:
         # Decode each token in the list, handling nested merges recursively
         return ''.join(expand_token(token) for token in tokens)
 
-tokenizer = SimpleTokenizer(loaded_stoi, loaded_merges)
+def load_tokenizer_data(size: int):
+    file_name = f'./tokenizers/tiny_shakespeare_tokenizer_{size}.model'
+    with open(file_name, 'rb') as f:
+        tokenizer_data = pickle.load(f)
+    return tokenizer_data
+
+def get_tokenizer(size: int):
+    tokenizer_data = load_tokenizer_data(size)
+    loaded_stoi = tokenizer_data['stoi']
+    loaded_merges = tokenizer_data['merges']
+    return SimpleTokenizer(loaded_stoi, loaded_merges)
